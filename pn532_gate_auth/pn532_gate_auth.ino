@@ -52,6 +52,8 @@
 
 // ---------------------------------------------------------------- config ----
 #define DEBUG           1
+#define POLL_WAIT_AWAKE 0 //1        // 1 = wait for the poll answer awake (works, polls take ~15-30 ms)
+                                 // 0 = sleep in power-down until IRQ (failed with a phone in range)
 #define DIAG_NO_POLL    0        // 1 = never poll, only sleep (measure the sleep floor)
 
 #define PN532_IRQ_PIN   2        // INT0
@@ -59,14 +61,15 @@
 
 // Watchdog periods: WDTO_15MS, 30MS, 60MS, 120MS, 250MS, 500MS, 1S, 2S, 4S, 8S
 #define POLL_PERIOD     WDTO_500MS   // sleep between polls (= max detection latency)
-#define POLL_TIMEOUT    WDTO_250MS   // max wait for the poll response
+#define POLL_TIMEOUT    WDTO_1S      // max wait for the poll response (diagnosis: generous)
+#define POLL_FIELD_ON   0            // 1 = switch the RF field on explicitly before each poll
 #define POLL_RETRIES    0x01         // MxRtyPassiveActivation (0xFF = infinite, avoid)
 #define FAIL_LOCKOUT    WDTO_2S      // sleep after a failed authentication
 #define OPEN_LOCKOUT    WDTO_4S      // sleep after opening (phone is probably still there)
 
 #define GATE_PIN        4
-#define GATE_ACTIVE     HIGH         // level that operates the gate relay
-#define GATE_PULSE      WDTO_1S      // how long the relay is operated
+#define GATE_ACTIVE     LOW          // level that operates the gate relay
+#define GATE_PULSE      WDTO_2S      // how long the relay is operated
 
 static const uint8_t AID[] = { 0xF0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
 
@@ -112,6 +115,8 @@ static const uint16_t ADMIN_IDS[] = { 0x0001, 0x0002 };
 #define R_OPEN            1      // open the gate
 #define R_FAIL            2      // failed attempt -> longer lockout
 
+// Types used in function signatures must be defined before the first function:
+// the Arduino IDE generates prototypes and puts them above it.
 struct Sha256 {
   uint32_t h[8];
   uint8_t  buf[64];
@@ -137,20 +142,6 @@ struct Sha256 {
   #define LOGHEX(d, n)
 #endif
 
-// ------------------------------------------------------- SHA-256 / HMAC -----
-static const uint32_t K256[64] PROGMEM = {
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
-
-static const uint32_t H256[8] PROGMEM = {
-  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
-
 // ------------------------------------------------------------ sleep ---------
 ISR(WDT_vect) { }                       // must exist, otherwise the WDT interrupt resets the chip
 
@@ -174,8 +165,9 @@ static void sleepPD(uint8_t wdto, bool useIrq) {
 
   wdt_reset();
   MCUSR &= ~_BV(WDRF);
-  WDTCSR |= _BV(WDCE) | _BV(WDE);       // timed sequence: change WDT config
-  WDTCSR = _BV(WDIE) | ((wdto & 0x08) ? _BV(WDP3) : 0) | (wdto & 0x07);   // interrupt mode only
+  wdt_enable(wdto);                     // avr-libc does the 4-cycle timed sequence safely
+  WDTCSR |= _BV(WDIE);                  // first timeout = interrupt (wakes us); wdt_disable() below
+                                        // runs right after wake-up, before a second timeout can reset
 
   sleep_enable();
 #ifdef sleep_bod_disable
@@ -337,26 +329,58 @@ static uint8_t pollForPhone() {
   uint8_t resp[32];
   const uint8_t cmd[] = { 0x4A, 0x01, 0x00 };              // InListPassiveTarget, 1 target, 106 kbps A
 
-  pn532RfField(true);                                      // explicit field on
+#if POLL_FIELD_ON
+  pn532RfField(true);
+#endif
   if (!pn532Send(cmd, sizeof(cmd))) {
     LOGLN(F("poll: send failed"));
     pn532RfField(false);
     return 0;
   }
-  sleepPD(POLL_TIMEOUT, true);                             // wake on IRQ or timeout
-
-  if (digitalRead(PN532_IRQ_PIN) == HIGH) {                // no response in time
-    pn532Abort();
-    LOGLN(F("poll: timeout, aborted"));
-    pn532RfField(false);
-    return 0;
+#if POLL_WAIT_AWAKE
+  {
+    uint32_t t0 = millis();
+    bool got = waitIrqLow(1500);                           // awake, so millis() keeps running
+    if (!got || millis() - t0 > 60) {                      // only log unusual waits
+      LOG(F("poll: IRQ ")); LOG(got ? F("low after ") : F("still high after "));
+      LOG(millis() - t0); LOGLN(F(" ms"));
+    }
   }
-  int16_t n = pn532Receive(resp, sizeof(resp), cmd[0]);
+#else
+  sleepPD(POLL_TIMEOUT, true);                             // wake on IRQ or timeout
+#endif
+
+  int16_t n;
+  if (digitalRead(PN532_IRQ_PIN) == HIGH) {                // no IRQ in time
+    n = pn532Receive(resp, sizeof(resp), cmd[0]);          // maybe the answer is ready anyway?
+    if (n < 0) {                                           // -2 = PN532 says "not ready"
+      // Still busy. A new command aborts the running one (manual 6.2.2.2 b), and
+      // GetGeneralStatus also tells why: last error, external RF field, targets.
+      const uint8_t cmdSt[] = { 0x04 };
+      uint8_t st[16];
+      int16_t sn = pn532Command(cmdSt, sizeof(cmdSt), st, sizeof(st), 200);
+      LOG(F("poll: still busy, aborted (read err ")); LOG(n); LOG(F(")"));
+      if (sn >= 4) {
+        LOG(F(" last error 0x")); LOG(st[1], HEX);
+        LOG(F(", external field ")); LOG(st[2]);
+        LOG(F(", targets ")); LOGLN(st[3]);
+      } else {
+        LOG(F(", status read err ")); LOGLN(sn);
+      }
+      const uint8_t cmdRel[] = { 0x52, 0x00 };             // InRelease: forget a half-activated target
+      pn532Command(cmdRel, sizeof(cmdRel), st, sizeof(st), 200);
+      pn532RfField(false);
+      return 0;
+    }
+    LOGLN(F("poll: answer was ready but IRQ stayed high (check IRQ wiring)"));
+  } else {
+    n = pn532Receive(resp, sizeof(resp), cmd[0]);
+  }
   if (n < 3 || resp[1] == 0) {
     LOGLN(F("poll: no target"));
     pn532RfField(false);
     return 0;
-  }                     // NbTg = 0 -> nobody there
+  }
 
   // resp: 4B NbTg Tg SENS_RES(2) SEL_RES NFCIDLen NFCID...
   LOG(F("Phone found, UID: "));
@@ -365,6 +389,19 @@ static uint8_t pollForPhone() {
   return resp[2];
 }
 
+// ------------------------------------------------------- SHA-256 / HMAC -----
+static const uint32_t K256[64] PROGMEM = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+
+static const uint32_t H256[8] PROGMEM = {
+  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
 
 static inline uint32_t rotr32(uint32_t x, uint8_t n) { return (x >> n) | (x << (32 - n)); }
 
@@ -548,7 +585,9 @@ static void computeMac(uint16_t id, uint8_t cmd, uint16_t arg,
 static void sendResult(uint8_t tg, uint8_t code) {
   const uint8_t apdu[4] = { 0x80, 0x30, code, 0x00 };
   uint8_t data[8];
-  pn532DataExchange(tg, apdu, sizeof(apdu), data, sizeof(data));
+  if (pn532DataExchange(tg, apdu, sizeof(apdu), data, sizeof(data)) < 0) {
+    LOG(F("(result 0x")); LOG(code, HEX); LOGLN(F(" not delivered to the phone)"));
+  }
 }
 
 // A new phone asked to join. Only works while the enrollment window is open.
@@ -718,6 +757,9 @@ void setup() {
   else        { LOG(F("ReadRegister failed, err=")); LOGLN(n); }
 
   LOG(F("boot #")); LOGLN(bootCounter);
+  LOG(F("settings: POLL_PERIOD code ")); LOG(POLL_PERIOD);          // WDTO_ code: 5 = 500 ms, 6 = 1 s
+  LOG(F(", POLL_WAIT_AWAKE ")); LOG(POLL_WAIT_AWAKE);
+  LOG(F(", DIAG_NO_POLL ")); LOGLN(DIAG_NO_POLL);
   LOGLN(F("Ready, polling."));
 }
 
@@ -727,6 +769,7 @@ void loop() {
   if (enrollLeft) enrollLeft--;                            // enrollment window runs out
 
 #if DIAG_NO_POLL
+  LOGLN(F("tick"));                                         // one line per wake-up
   return;
 #endif
   uint8_t tg = pollForPhone();
